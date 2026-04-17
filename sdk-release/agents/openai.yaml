@@ -1,0 +1,4 @@
+interface:
+  display_name: "SDK Release Review"
+  short_description: "Analyze RC diffs, changelog coverage, and QA risk"
+  default_prompt: "Use $sdk-release to compare a source release branch or tag with a destination release candidate, validate the changelog, and produce risks plus manual QA scenarios."
