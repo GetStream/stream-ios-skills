@@ -19,25 +19,17 @@ callbacks occur on non-main threads and dispatch to main as needed.
 
 Recommended app shape:
 
-- In a publisher/subscriber architecture, use one call coordinator plus one
-  serialized Swift actor or queue per `RTCPeerConnection`.
-- Keep publisher and subscriber PeerConnection state separate. Publisher SDP/ICE,
-  local senders, camera, and bitrate changes should not serialize behind
-  subscriber SDP/ICE or remote-renderer state unless a call-level transition
-  requires it.
-- Keep signaling and ICE ingestion separate when backend callbacks, network
-  retries, candidate buffering, or persistence could block call state.
-- Apply SDP before queued ICE candidates; preserve signaling order at the app
-  boundary.
-- Use Swift `.typeAudioSession` (`RTCDispatcherTypeAudioSession`) for
-  audio-session configuration, route overrides, and CallKit handoffs into the
-  audio coordinator.
-- Keep video capture on capture/session queues and render view ownership on main.
-- Put stats polling, file logs, uploads, and diagnostics formatting on a
-  diagnostics queue.
-- Keep WebRTC callbacks, AudioEngine observer callbacks, audio callbacks, render
-  callbacks, and logging callbacks fast; hop before touching product state or
-  calling WebRTC again.
+- Use one call coordinator plus one serialized Swift actor or queue per
+  `RTCPeerConnection`.
+- Keep publisher and subscriber PeerConnection state separate unless a call-level
+  transition requires coordination.
+- Preserve SDP-before-ICE ordering at the app boundary.
+- Route shared platform work to the right owner: audio through
+  `RTCDispatcher.dispatchAsync(on: .typeAudioSession, block:)`, capture through
+  `.typeCaptureSession`, render/view-model updates through `MainActor`, and
+  stats/log work through a diagnostics queue.
+- Keep WebRTC, AudioEngine, audio, render, and logging callbacks fast; hop before
+  touching product state or calling WebRTC again.
 
 Do not expose WebRTC's internal signaling/worker/network threads as app
 architecture. The app owns ordering at its API boundary; WebRTC handles its
@@ -48,183 +40,8 @@ SDK call must happen from a specific GCD queue. WebRTC Obj-C objects are not
 documented as `Sendable`; keep ownership on the relevant call or PeerConnection
 actor and pass simple values across concurrency boundaries.
 
-```swift
-actor PeerConnectionSession {
-    private let peerConnection: RTCPeerConnection
-
-    func applyRemoteDescription(_ sdp: RTCSessionDescription) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            peerConnection.setRemoteDescription(sdp) { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            }
-        }
-    }
-}
-```
-
-Use a call-level coordinator for shared policy:
-
-```swift
-actor CallSession {
-    private let publisher: PeerConnectionSession
-    private let subscriber: PeerConnectionSession
-    private let audioCoordinator: AudioCoordinator
-
-    func handleRemoteCandidate(_ candidate: RTCIceCandidate, role: PeerConnectionRole) async {
-        switch role {
-        case .publisher:
-            await publisher.handleRemoteCandidate(candidate)
-        case .subscriber:
-            await subscriber.handleRemoteCandidate(candidate)
-        }
-    }
-
-    func setSpeakerEnabled(_ enabled: Bool) {
-        audioCoordinator.setSpeakerEnabled(enabled)
-    }
-}
-```
-
-Use `MainActor` only for UI, renderer view ownership, and view-model state:
-
-```swift
-Task { @MainActor in
-    remoteVideoTrack.add(renderer)
-}
-```
-
-For WebRTC dispatcher queues from Swift:
-
-```swift
-RTCDispatcher.dispatchAsync(on: .typeAudioSession, block: {
-    // RTCAudioSession work
-})
-
-RTCDispatcher.dispatchAsync(on: .typeCaptureSession, block: {
-    // AVCaptureSession start/stop or preview-session assignment
-})
-```
-
-If the imported enum cases differ in a fork, inspect the generated WebRTC module
-interface. The Obj-C source names are `RTCDispatcherTypeAudioSession` and
-`RTCDispatcherTypeCaptureSession`.
-
-Minimal flow:
-
-```mermaid
-sequenceDiagram
-  participant MainActor
-  participant SignalingIceQueue
-  participant CallCoordinator
-  participant PublisherPCActor
-  participant SubscriberPCActor
-  participant WebRTCSDK
-  participant AudioDispatcher
-  participant CaptureDispatcher
-  participant DiagnosticsQueue
-
-  MainActor->>CallCoordinator: call-level UI intent
-  SignalingIceQueue->>CallCoordinator: role-tagged SDP and ICE
-  CallCoordinator->>PublisherPCActor: publisher operation
-  CallCoordinator->>SubscriberPCActor: subscriber operation
-  PublisherPCActor->>WebRTCSDK: publisher PeerConnection call
-  SubscriberPCActor->>WebRTCSDK: subscriber PeerConnection call
-  WebRTCSDK-->>PublisherPCActor: publisher delegate or completion
-  WebRTCSDK-->>SubscriberPCActor: subscriber delegate or completion
-  PublisherPCActor->>CallCoordinator: accepted publisher event
-  SubscriberPCActor->>CallCoordinator: accepted subscriber event
-  CallCoordinator->>AudioDispatcher: shared audio-session work
-  CallCoordinator->>CaptureDispatcher: publisher capture start or stop
-  CallCoordinator->>MainActor: subscriber renderer and UI updates
-  CallCoordinator->>DiagnosticsQueue: call stats and log work
-```
-
-1. `MainActor` handles UI intent and renderer/view-model ownership.
-2. The signaling/ICE queue receives backend messages and preserves SDP-before-ICE
-   ordering per PeerConnection role.
-3. The call coordinator routes role-tagged work to the publisher or subscriber
-   PeerConnection actor.
-4. Each PeerConnection actor owns one `RTCPeerConnection` and serializes its own
-   SDP, ICE, transceiver, sender/receiver, and cleanup state.
-5. WebRTC delegates and completions immediately hop back to the matching
-   PeerConnection actor before touching app state or calling WebRTC again.
-6. The call coordinator routes shared platform work to the right owner:
-   - audio policy: `RTCDispatcher.dispatchAsync(on: .typeAudioSession, block:)`
-     into the audio coordinator
-   - capture start/stop: `RTCDispatcher.dispatchAsync(on: .typeCaptureSession,
-     block:)` into the capture owner
-   - UI updates: `MainActor`
-   - stats/log formatting: diagnostics queue
-
-PeerConnection-state decisions are the small checks and mutations that keep one
-`RTCPeerConnection` lifecycle coherent. Keep these serialized per role; do not
-make publisher ICE wait behind subscriber rendering, and do not keep an actor
-occupied while unrelated platform work runs.
-
-Examples:
-
-| Event | Owner decides | Downstream owner does |
-| --- | --- | --- |
-| Publisher SDP arrives | Publisher PC actor checks call generation, signaling state, and queued publisher ICE. | Publisher `RTCPeerConnection` applies SDP. |
-| Subscriber ICE arrives | Subscriber PC actor checks remote SDP and queues/drops/applies the candidate. | Subscriber `RTCPeerConnection` applies ICE when allowed. |
-| User toggles speaker | Call coordinator checks call activity and records desired shared route state. | Audio dispatcher performs `RTCAudioSession` locking and route override. |
-| User starts camera | Call coordinator or publisher PC actor checks publish state and whether capture is already running. | Capture dispatcher starts/stops `AVCaptureSession`. |
-| Remote video track arrives | Subscriber PC actor accepts the receiver/transceiver event if current. | MainActor attaches renderer or updates UI. |
-| Hangup starts | Call coordinator marks call closed; publisher and subscriber actors invalidate pending operation tokens. | Audio, capture, diagnostics, UI, and both PeerConnections clean up on their owners. |
-| WebRTC callback fires | Matching PC actor checks role, generation, and closed state. | UI/audio/diagnostics update only after the actor accepts the event. |
-
-Pattern:
-
-```swift
-actor PeerConnectionSession {
-    private let role: PeerConnectionRole
-    private let peerConnection: RTCPeerConnection
-    private var isClosed = false
-    private var hasRemoteDescription = false
-    private var pendingCandidates: [RTCIceCandidate] = []
-
-    func handleRemoteCandidate(_ candidate: RTCIceCandidate) {
-        guard !isClosed else { return }
-        guard hasRemoteDescription else {
-            pendingCandidates.append(candidate)
-            return
-        }
-        peerConnection.add(candidate) { [weak self] error in
-            Task { await self?.handleCandidateResult(error) }
-        }
-    }
-}
-
-actor CallSession {
-    private let publisher: PeerConnectionSession
-    private let subscriber: PeerConnectionSession
-    private let audioCoordinator: AudioCoordinator
-    private var isClosed = false
-    private var desiredSpeakerEnabled = false
-
-    func setSpeakerEnabled(_ enabled: Bool) {
-        guard !isClosed else { return }
-        desiredSpeakerEnabled = enabled
-        audioCoordinator.setSpeakerEnabled(enabled)
-    }
-}
-```
-
-Timing risks:
-
-- Reentrant WebRTC calls from callbacks can deadlock or race with internal proxy
-  dispatch.
-- Blocking a callback can delay signaling, media state, or logging paths.
-- Dispatching SDP and ICE through different queues without an ordering gate can
-  apply candidates before the remote description.
-- Hangup must invalidate queued callbacks so stale completions do not resurrect
-  closed call state.
-- Audio/session callbacks can race with CallKit and route changes; centralize
-  them in one audio coordinator.
+For detailed actor/queue layout, publisher/subscriber ownership, callback
+handoffs, and race examples, read `threading-swift.md`.
 
 ## Swift Bridging
 

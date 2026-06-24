@@ -27,17 +27,19 @@ Keep this skill portable across Codex, Cursor, and Claude:
 ## Workflow
 
 1. Identify the user's integration area: PeerConnection, signaling, media, audio, rendering, threading, data channels, security, diagnostics, or tests.
-2. Read the matching reference file below before advising or editing.
+2. Read only the narrowest matching reference file below before advising or editing; add more references only when the task crosses areas.
 3. Prefer public Obj-C SDK headers in `sdk/objc/api`, `sdk/objc/base`, and `sdk/objc/components`, then present app-facing examples in Swift.
 4. Use `examples/objc/AppRTCMobile` as the practical sample, not as production architecture to copy wholesale.
-5. Keep changes minimal and app-owned: WebRTC handles media/transport primitives; the app owns signaling, permissions, lifecycle, and UI state.
+5. Keep changes minimal and app-owned: WebRTC handles media/transport primitives; the app owns signaling, permissions, lifecycle, threading, and UI state.
+6. In answers, name the repo files inspected and label advice as public API, sample-app pattern, fork-specific surface, or WebRTC internal.
 
 ## References
 
 - For repo orientation, public API boundaries, and PeerConnection architecture, read `references/architecture.md`.
 - For setup, signaling, negotiation, media sender/receiver flows, and cleanup, read `references/usage-flows.md`.
 - For camera/file/broadcast capture, renderers, audio session, routing, interruptions, and CallKit/manual audio, read `references/media-audio-ui.md`.
-- For threading architecture, Swift bridging, codecs, RTP tuning, data channels, security, and privacy, read `references/best-practices.md`.
+- For threading rules, Swift bridging basics, codecs, RTP tuning, data channels, security, and privacy, read `references/best-practices.md`.
+- For detailed Swift concurrency, actors/queues, publisher/subscriber ownership, and callback race guidance, read `references/threading-swift.md`.
 - For logs, stats, RTC event logs, AEC dumps, tests, CI validation, and troubleshooting, read `references/diagnostics-testing.md`.
 - For exact source files to inspect by task, read `references/repo-guide.md`.
 
