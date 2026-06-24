@@ -1,0 +1,4 @@
+interface:
+  display_name: "Triage GH Issue"
+  short_description: "Triage Stream iOS GitHub issue reports"
+  default_prompt: "Use $triage-gh-issue to validate gh access and repo context, read the full GitHub issue thread, classify configuration vs SDK issues, inspect Stream iOS docs or repository evidence, and draft a customer reply."
