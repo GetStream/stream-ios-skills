@@ -62,6 +62,29 @@ interface. Obj-C names include `RTCDispatcherTypeAudioSession` and
 Wrap completion-handler APIs at the app boundary. This is a shape, not drop-in
 code; map errors, candidate draining, and closed-call behavior to product state.
 
+Use a call-level coordinator for shared policy:
+
+```swift
+actor CallSession {
+    private let publisher: PeerConnectionSession
+    private let subscriber: PeerConnectionSession
+    private let audioCoordinator: AudioCoordinator
+
+    func handleRemoteCandidate(_ candidate: RTCIceCandidate, role: PeerConnectionRole) async {
+        switch role {
+        case .publisher:
+            await publisher.handleRemoteCandidate(candidate)
+        case .subscriber:
+            await subscriber.handleRemoteCandidate(candidate)
+        }
+    }
+
+    func setSpeakerEnabled(_ enabled: Bool) {
+        audioCoordinator.setSpeakerEnabled(enabled)
+    }
+}
+```
+
 ```swift
 actor PeerConnectionSession {
     private let peerConnection: RTCPeerConnection
@@ -116,6 +139,53 @@ Task { @MainActor in
 }
 ```
 
+## Dual PeerConnection Flow
+
+```mermaid
+sequenceDiagram
+  participant MainActor
+  participant SignalingIceQueue
+  participant CallCoordinator
+  participant PublisherPCActor
+  participant SubscriberPCActor
+  participant WebRTCSDK
+  participant AudioDispatcher
+  participant CaptureDispatcher
+  participant DiagnosticsQueue
+
+  MainActor->>CallCoordinator: call-level UI intent
+  SignalingIceQueue->>CallCoordinator: role-tagged SDP and ICE
+  CallCoordinator->>PublisherPCActor: publisher operation
+  CallCoordinator->>SubscriberPCActor: subscriber operation
+  PublisherPCActor->>WebRTCSDK: publisher PeerConnection call
+  SubscriberPCActor->>WebRTCSDK: subscriber PeerConnection call
+  WebRTCSDK-->>PublisherPCActor: publisher delegate or completion
+  WebRTCSDK-->>SubscriberPCActor: subscriber delegate or completion
+  PublisherPCActor->>CallCoordinator: accepted publisher event
+  SubscriberPCActor->>CallCoordinator: accepted subscriber event
+  CallCoordinator->>AudioDispatcher: shared audio-session work
+  CallCoordinator->>CaptureDispatcher: publisher capture start or stop
+  CallCoordinator->>MainActor: subscriber renderer and UI updates
+  CallCoordinator->>DiagnosticsQueue: call stats and log work
+```
+
+1. `MainActor` handles UI intent and renderer/view-model ownership.
+2. The signaling/ICE queue receives backend messages and preserves SDP-before-ICE
+   ordering per PeerConnection role.
+3. The call coordinator routes role-tagged work to the publisher or subscriber
+   PeerConnection actor.
+4. Each PeerConnection actor owns one `RTCPeerConnection` and serializes its own
+   SDP, ICE, transceiver, sender/receiver, and cleanup state.
+5. WebRTC delegates and completions immediately hop back to the matching
+   PeerConnection actor before touching app state or calling WebRTC again.
+6. The call coordinator routes shared platform work to the right owner:
+   - audio policy: `RTCDispatcher.dispatchAsync(on: .typeAudioSession, block:)`
+     into the audio coordinator
+   - capture start/stop: `RTCDispatcher.dispatchAsync(on: .typeCaptureSession,
+     block:)` into the capture owner
+   - UI updates: `MainActor`
+   - stats/log formatting: diagnostics queue
+
 ## Event Routing
 
 - Publisher SDP arrives: publisher owner checks generation, signaling state, and
@@ -133,6 +203,23 @@ Task { @MainActor in
   PeerConnection owner to clean up.
 - WebRTC callback fires: matching owner checks role, generation, and closed state
   before publishing UI, audio, or diagnostics changes.
+
+PeerConnection-state decisions are the small checks and mutations that keep one
+`RTCPeerConnection` lifecycle coherent. Keep these serialized per role; do not
+make publisher ICE wait behind subscriber rendering, and do not keep an actor
+occupied while unrelated platform work runs.
+
+Examples:
+
+| Event | Owner decides | Downstream owner does |
+| --- | --- | --- |
+| Publisher SDP arrives | Publisher PC actor checks call generation, signaling state, and queued publisher ICE. | Publisher `RTCPeerConnection` applies SDP. |
+| Subscriber ICE arrives | Subscriber PC actor checks remote SDP and queues/drops/applies the candidate. | Subscriber `RTCPeerConnection` applies ICE when allowed. |
+| User toggles speaker | Call coordinator checks call activity and records desired shared route state. | Audio dispatcher performs `RTCAudioSession` locking and route override. |
+| User starts camera | Call coordinator or publisher PC actor checks publish state and whether capture is already running. | Capture dispatcher starts/stops `AVCaptureSession`. |
+| Remote video track arrives | Subscriber PC actor accepts the receiver/transceiver event if current. | MainActor attaches renderer or updates UI. |
+| Hangup starts | Call coordinator marks call closed; publisher and subscriber actors invalidate pending operation tokens. | Audio, capture, diagnostics, UI, and both PeerConnections clean up on their owners. |
+| WebRTC callback fires | Matching PC actor checks role, generation, and closed state. | UI/audio/diagnostics update only after the actor accepts the event. |
 
 ## Race Checklist
 
